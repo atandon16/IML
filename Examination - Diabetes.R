@@ -154,10 +154,23 @@ graph_learner_elastic_net$predict(task_test)$score(msr("classif.ce"))
   #### 3.Interpretability vs. accuracy
 #You should explicitly discuss the trade-off between interpretability and predictive accuracy.
 
+#The simpler model (logistic reg) is more interpretable but less accurate than e.g. elastic net regularization.
+#Show examples with model naive model, logistic etc.
+
+
 #### 3. Sensitive or protected features
 #You should explicitly consider the role of potentially sensitive features in your chosen dataset.
 #For the CDC Diabetes Health Indicators dataset, this this could for example be a variables such as BMI.
 
+#The most relevant variable are sensitive
+#Vizualisation for sensitive variables and non-sensitive for comparison
+
+
 #In addition to your main final model, you should report a second model that does not make use of chosen sensitive variables, neither directly nor indirectly. 
 #You should explain how you identified and handled such variables, and you should compare the original model and the restricted model. In particular, you should discuss what changed.
+
+#Sensitiv evariables can be identified by intution previous research, and also by modelling the data.
+#compare prediction of models without sensitive variables. We would expect less accuracy using the same models.
+
+
 
