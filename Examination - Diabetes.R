@@ -148,7 +148,7 @@ graph_learner_elastic_net$predict(task_test)$score(msr("classif.ce"))
 #Specificity: Ability to correctly identify true negatives. How many of the no-diabetes cases we predict truly dont have diabetes.
 #Sensitivity: The ability to correctly identify true positives. How many of the diabetes cases we predict truly have diabetes.
 #Accuracy: Overall correct predictions
-
+#Precision
 
 
   #### 3.Interpretability vs. accuracy
