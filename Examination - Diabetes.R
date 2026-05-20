@@ -154,11 +154,11 @@ graph_learner_elastic_net$predict(task_test)$score(msr("classif.ce"))
 #Which features, or combinations of features, appear important for prediction? How do they impact the prediction? 
 #To what extent is it possible to understand or interpret the predictions made by your chosen model?
 
-#Classification error: How far is the predictions of the model from the true values.
+#Classification error: Proprtion of incorrect predictions.
 #Specificity: Ability to correctly identify true negatives. How many of the no-diabetes cases we predict truly dont have diabetes.
 #Sensitivity: The ability to correctly identify true positives. How many of the diabetes cases we predict truly have diabetes.
-#Accuracy: Overall correct predictions
-#Precision
+#Accuracy: Proprtion of correct predictions.
+
 
 
 #### 5.Interpretability vs. accuracy
