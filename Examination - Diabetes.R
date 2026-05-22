@@ -124,13 +124,152 @@ instance$result_learner_param_vals
 
 instance$result_y
 
-# keep an untuned copy of the same graph for the auto_tuner example below
+# keep an untuned copy of the same graph for the auto_tuner
 graph_learner_elastic_net_auto = graph_learner_elastic_net$clone(deep = TRUE)
 
 # result on test set
 graph_learner_elastic_net$param_set$values = instance$result_learner_param_vals
 graph_learner_elastic_net$train(task_train)
 graph_learner_elastic_net$predict(task_test)$score(msr("classif.ce"))
+
+
+
+
+#Decision tree
+set.seed(123)
+
+# load data and define task
+task = as_task_classif(diabetes, target = "Diabetes_binary")
+
+# Diabetes = 1 is the outcome of interest.
+positive_class = "1"
+task$positive = positive_class
+
+#Create a graph that dummy-encodes categorical features and then applies learner
+categorical_selector = selector_type(c("factor", "ordered"))
+
+make_encoded_learner = function(learner) {
+  as_learner(
+    po("encode", method = "treatment",
+       affect_columns = categorical_selector, id = "binary_enc") %>>%
+      learner
+  )
+}
+
+# and visualize a large CART tree
+my_cart_learner = lrn("classif.rpart", cp = 0, predict_type = "prob")
+
+full_tree = make_encoded_learner(my_cart_learner)
+full_tree$train(task)
+
+cart_trained <- full_tree$model$classif.rpart$model
+plot(cart_trained, compress = TRUE, margin = 0.1)
+text(cart_trained, use.n = TRUE, cex = 0.4) # Adjust cex (font size) as needed
+
+
+# Full tree CE
+rr_full = resample(
+  task,
+  full_tree,
+  rsmp("cv", folds = 5)
+)
+
+rr_full$aggregate(msr("classif.ce"))
+
+#Cross-validation path for pruning parameter (weakest-link pruning)
+my_cart_learner_cv = lrn("classif.rpart",
+                         cp = 0,
+                         xval = 5,
+                         predict_type = "prob")
+
+graph_learner_cart_cv = make_encoded_learner(my_cart_learner_cv)
+graph_learner_cart_cv$train(task)
+
+cart_trained_cv <- graph_learner_cart_cv$model$classif.rpart$model
+
+rpart::plotcp(cart_trained_cv)
+rpart::printcp(cart_trained_cv)
+
+#Select cp by the one-standard-error rule and prune
+cp_table = cart_trained_cv$cptable
+min_row = which.min(cp_table[, "xerror"])
+one_se_threshold = cp_table[min_row, "xerror"] + cp_table[min_row, "xstd"]
+
+# rpart orders the table from simpler to larger trees, so the first row within
+# the one-SE threshold gives the simplest acceptable tree.
+selected_row = which(cp_table[, "xerror"] <= one_se_threshold)[1]
+selected_cp = cp_table[selected_row, "CP"]
+selected_cp
+
+my_cart_learner_pruned = lrn("classif.rpart",
+                             cp = selected_cp,
+                             predict_type = "prob")
+
+pruned_tree = make_encoded_learner(my_cart_learner_pruned)
+pruned_tree$train(task)
+
+cart_trained_pruned <- pruned_tree$model$classif.rpart$model
+
+plot(cart_trained_pruned, compress = TRUE, margin = 0.1)
+text(cart_trained_pruned, use.n = TRUE, cex = 0.5)
+
+
+# Pruned tree CE for weakest-link pruning
+rr_pruned = resample(
+  task,
+  pruned_tree,
+  rsmp("cv", folds = 5)
+)
+
+rr_pruned$aggregate(msr("classif.ce"))
+
+
+
+#Random Forest
+rf_learner = lrn(
+  "classif.ranger",
+  predict_type = "prob"
+)
+
+rf_model = make_encoded_learner(rf_learner)
+
+rf_model$train(task)
+
+#CE for random forest
+rr_rf = resample(
+  task,
+  rf_model,
+  rsmp("cv", folds = 5)
+)
+
+rr_rf$aggregate(msr("classif.ce"))
+
+
+
+#XGboost
+xgb_learner = lrn(
+  "classif.xgboost",
+  predict_type = "prob"
+)
+
+xgb_model = make_encoded_learner(xgb_learner)
+
+xgb_model$train(task)
+
+#CE for XGboost
+rr_xgb = resample(
+  task,
+  xgb_model,
+  rsmp("cv", folds = 5)
+)
+
+rr_xgb$aggregate(msr("classif.ce"))
+
+
+
+#Neural Network?
+
+
 
 
 #### 3. Model performance
@@ -144,21 +283,31 @@ graph_learner_elastic_net$predict(task_test)$score(msr("classif.ce"))
 #Baseline with no features
 #Classification error (CE) = 0.139881
 
-##Elastic net regularization (Best prediction)
+##Elastic net regularization 
 #Classification error (CE) = 0.1357222 
 
+##Full decision tree 
+#Classification error (CE) =  0.1558341
 
+##Pruned decision tree (weakest-link pruning)
+#Classification error (CE) = 0.1346421
+
+##Decision tree (Random forest)
+#Classification error (CE) = 0.133763
+
+##Decision tree (XGboost)
+#Classification error (CE) = 0.1416391
 
 
 #### 4. Interpretability and feature importance
 #Which features, or combinations of features, appear important for prediction? How do they impact the prediction? 
 #To what extent is it possible to understand or interpret the predictions made by your chosen model?
 
-#Classification error: Proprtion of incorrect predictions.
+#Classification error: How far is the predictions of the model from the true values.
 #Specificity: Ability to correctly identify true negatives. How many of the no-diabetes cases we predict truly dont have diabetes.
 #Sensitivity: The ability to correctly identify true positives. How many of the diabetes cases we predict truly have diabetes.
-#Accuracy: Proprtion of correct predictions.
-
+#Accuracy: Overall correct predictions
+#Precision
 
 
 #### 5.Interpretability vs. accuracy
