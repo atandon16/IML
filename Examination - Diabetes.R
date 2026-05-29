@@ -4,6 +4,11 @@
 
 library(mlr3)
 library(mlr3learners)
+library(mlr3torch)
+library(mlr3viz)
+library(fastshap)
+library(iml)
+library(ggplot2)
 library(mlr3tuning)
 library(mlr3mbo)
 library(mlr3pipelines)
@@ -58,7 +63,7 @@ sum(duplicated(diabetes))
 #Which models are relevant for this task? Which models did you try, which model or models did you choose to focus on, and why?
 
 #We start by define task in the dataset and splitting it (80% training 20% test)
-task = as_task_classif(diabetes, target = "Diabetes_binary")
+task = as_task_classif(diabetes, target = "Diabetes_binary", positive = "1")
 set.seed(2026)
 splits = partition(task, ratio = 0.8)
 
@@ -267,9 +272,92 @@ rr_xgb$aggregate(msr("classif.ce"))
 
 
 
-#Neural Network?
+#Neural Network
+search_space <- ps(
+  neurons = p_int(lower = 16, upper = 128),
+  p = p_dbl(lower = 0.1, upper = 0.5),
+  batch_size = p_int(lower = 64, upper = 256),
+  epochs = p_int(lower = 20, upper = 50),
+  n_layers = p_int(lower = 1, upper = 20),
+  activation = p_fct(levels = c(nn_relu, nn_leaky_relu, nn_elu, nn_gelu, nn_tanh))
+)
+
+learner <- lrn("classif.mlp",
+               predict_type = "prob",
+               epochs = 30,
+               batch_size = 128,
+               neurons = 32,
+               p = 0.2,
+               optimizer = "adam",
+)
+
+resampling <- rsmp("cv", folds = 5)
+measure <- msr("classif.recall", id = "recall")
+tuner <- tnr("random_search")
+at <- auto_tuner(
+  tuner = tuner,
+  learner = learner_mlp,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  term_evals = 20 
+)
+
+at$train(task_train)
+at$tuning_result
+best_params <- at$tuning_result$learner_param_vals[[1]]
+
+final_learner <- lrn("classif.mlp",
+                     predict_type = "prob",
+                     epochs = best_params$epochs,
+                     batch_size = best_params$batch_size,
+                     neurons = best_params$neurons,
+                     p = best_params$p,
+                     optimizer = "adam",
+                     n_layers = best_params$n_layers
+)
+final_learner$train(task_train)
+
+final_learner$predict(task_test)$score(msr("classif.ce"))
+final_learner$predict(task_test)$score(msr("classif.sensitivity"))
+final_learner$predict(task_test)$score(msr("classif.specificity"))
 
 
+# Find threshold that maximises accuracy and recall
+val_idx <- sample(task_train$nrow, size = floor(0.2 * task_train$nrow))
+val_task <- task_train$clone()$filter(val_idx)
+
+val_pred <- final_learner$predict(val_task)
+val_prob <- val_pred$prob[, "1"]
+val_true <- val_task$truth()
+
+thresholds <- seq(0.1, 0.9, by = 0.01)
+accuracy <- sapply(thresholds, function(th) {
+  pred_class <- ifelse(val_prob >= th, 1, 0)
+  tp <- sum(pred_class == 1 & val_true == 1)
+  fn <- sum(pred_class == 0 & val_true == 1)
+  fp <- sum(pred_class == 1 & val_true == 0)
+  acc <- tp / sqrt((tp + fn) * (tp + fp))
+  acc
+})
+
+best_threshold <- thresholds[which.max(accuracy)]
+
+
+test_task <- as_task_classif(task_test, target = "Diabetes_binary", positive = "1")
+test_pred <- final_learner$predict(test_task)
+test_prob <- test_pred$prob[, "1"]
+test_class <- ifelse(test_prob >= best_threshold, 1, 0)
+test_true <- test_task$truth()
+
+cm <- table(Predicted = test_class, Actual = test_true)
+recall_test <- cm[2,1] / sum(cm[,1])
+precision_test <- cm[2,1] / sum(cm[2,])
+ce_test <- (cm[1,1] + cm[2,2]) / sum(cm)
+
+cat(sprintf("Test CE-score: %.8f\n", ce_test))
+cat(sprintf("Test recall/sensitivity: %.8f\n", recall_test))
+cat(sprintf("Test precision: %.8f\n", precision_test))
 
 
 #### 3. Model performance
