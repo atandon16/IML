@@ -23,6 +23,7 @@ diabetes <- read.csv("C:/Users/THOL0099/Desktop/Diabetes.csv")
 
 #I use table to check if all values match the variable description, e.g. binary variables being 0 or 1, and see missing values.
 table(diabetes$Diabetes_binary, useNA = "ifany")
+prop.table(table(diabetes$Diabetes_binary, useNA = "ifany"))
 table(diabetes$HighBP, useNA = "ifany")
 table(diabetes$HighChol, useNA = "ifany")
 table(diabetes$CholCheck, useNA = "ifany")
@@ -65,10 +66,14 @@ splits = partition(task, ratio = 0.8)
 task_train = task$clone()$filter(splits$train)
 task_test = task$clone()$filter(splits$test)
 
+task_train$positive = "1"
+task_test$positive = "1"
+
 
 #Logistic Regression. Logistic regression can model probabilities for a binary outcome (diabetes yes/no) 
 
-my_lr_learner = lrn("classif.log_reg")
+my_lr_learner = lrn("classif.log_reg",
+                    predict_type = "prob")
 
 graph_learner_lr = as_learner(
   po("encode", method = "treatment", id = "binary_enc") %>>%
@@ -78,33 +83,32 @@ graph_learner_lr = as_learner(
 
 graph_learner_lr$train(task_train)
 graph_learner_lr$predict(task_test)$score(msr("classif.ce"))
-
+graph_learner_lr$predict(task_test)$score(msr("classif.sensitivity"))
+graph_learner_lr$predict(task_test)$score(msr("classif.specificity"))
+graph_learner_lr$predict(task_test)$score(msr("classif.auc"))
 
 
 #Baseline with no features
-
-baseline <- lrn("classif.featureless")$train(task_train)
+task_train$positive = "1"
+task_test$positive = "1"
+baseline <- lrn("classif.featureless",
+                predict_type = "prob")$train(task_train)
 baseline$predict(task_test)$score(msr("classif.ce"))
+baseline$predict(task_test)$score(msr("classif.sensitivity"))
+baseline$predict(task_test)$score(msr("classif.specificity"))
+baseline$predict(task_test)$score(msr("classif.auc"))
 
 
 
+#Elastic net. Elastic net combines Lasso (L1) and Ridde (L2) regularization in a model
 
-#Elastic net. Elastic net combines Lasso (L1) and Rigde (L2) regularization in a model
-#First we create a learner.
-my_elasticnet_learner = lrn(
-  "classif.glmnet", 
-  standardize = FALSE,
-  alpha = to_tune(0, 1),
-  lambda = to_tune(p_dbl(log(1e-5), log(1e1), trafo = exp))
-  # Alternatively lambda = to_tune(1e-5, 1e1, logscale=TRUE)
-)
+#First we create a learner. 
+my_elasticnet_learner = lrn( "classif.glmnet", predict_type = "prob", 
+standardize = FALSE, alpha = to_tune(0, 1), lambda = to_tune(p_dbl(log(1e-5), log(1e1), trafo = exp))) 
+# Alternatively lambda = to_tune(1e-5, 1e1, logscale=TRUE) ) 
 
 #We create a graph that converts factor variables into dummy variables, standardizes predictors, and afterwards applies elastic net
-graph_learner_elastic_net = as_learner(
-  po("encode", method = "treatment", id = "binary_enc") %>>%
-    po("scale") %>>%
-    my_elasticnet_learner
-)
+graph_learner_elastic_net = as_learner( po("encode", method = "treatment", id = "binary_enc") %>>% po("scale") %>>% my_elasticnet_learner )
 
 
 #Now we apply 5-fold cross-validation (train on 4 folds, validate on 1 fold, repeat 5 times). 
@@ -131,9 +135,9 @@ graph_learner_elastic_net_auto = graph_learner_elastic_net$clone(deep = TRUE)
 graph_learner_elastic_net$param_set$values = instance$result_learner_param_vals
 graph_learner_elastic_net$train(task_train)
 graph_learner_elastic_net$predict(task_test)$score(msr("classif.ce"))
-
-
-
+graph_learner_elastic_net$predict(task_test)$score(msr("classif.sensitivity"))
+graph_learner_elastic_net$predict(task_test)$score(msr("classif.specificity"))
+graph_learner_elastic_net$predict(task_test)$score(msr("classif.auc"))
 
 #Decision tree
 set.seed(123)
@@ -175,6 +179,9 @@ rr_full = resample(
 )
 
 rr_full$aggregate(msr("classif.ce"))
+rr_full$aggregate(msr("classif.sensitivity"))
+rr_full$aggregate(msr("classif.specificity"))
+rr_full$aggregate(msr("classif.auc"))
 
 #Cross-validation path for pruning parameter (weakest-link pruning)
 my_cart_learner_cv = lrn("classif.rpart",
@@ -222,7 +229,9 @@ rr_pruned = resample(
 )
 
 rr_pruned$aggregate(msr("classif.ce"))
-
+rr_pruned$aggregate(msr("classif.sensitivity"))
+rr_pruned$aggregate(msr("classif.specificity"))
+rr_pruned$aggregate(msr("classif.auc"))
 
 
 #Random Forest
@@ -243,6 +252,10 @@ rr_rf = resample(
 )
 
 rr_rf$aggregate(msr("classif.ce"))
+rr_rf$aggregate(msr("classif.sensitivity"))
+rr_rf$aggregate(msr("classif.specificity"))
+rr_rf$aggregate(msr("classif.auc"))
+
 
 
 
@@ -264,12 +277,81 @@ rr_xgb = resample(
 )
 
 rr_xgb$aggregate(msr("classif.ce"))
+rr_xgb$aggregate(msr("classif.sensitivity"))
+rr_xgb$aggregate(msr("classif.specificity"))
+rr_xgb$aggregate(msr("classif.auc"))
 
 
 
-#Neural Network?
+#Neural Network
+# Hyperparameter search space
+
+search_space <- ps(
+  classif.mlp.neurons = p_int(16, 128),
+  classif.mlp.p = p_dbl(0.1, 0.5),
+  classif.mlp.batch_size = p_int(64, 256),
+  classif.mlp.epochs = p_int(20, 50),
+  classif.mlp.n_layers = p_int(1, 20)
+)
 
 
+learner_mlp <- lrn(
+  "classif.mlp",
+  predict_type = "prob",
+  optimizer = "adam",
+  batch_size = 128,
+  epochs = 30,
+  neurons = 64 
+)
+
+
+# Resampling, measure, tuner
+resampling <- rsmp("cv", folds = 5)
+measure <- msr("classif.auc")
+tuner <- tnr("random_search")
+
+# AutoTuner
+at <- auto_tuner(
+  learner = learner_mlp,
+  resampling = resampling,
+  measure = measure,
+  tuner = tuner,
+  search_space = search_space,
+  terminator = trm("evals", n_evals = 20)
+)
+
+# Tune and train
+at$train(task_train)
+
+# Best hyperparameters
+best_params <- at$tuning_result$learner_param_vals
+
+print(best_params)
+
+# Final learner with best parameters
+final_learner <- lrn(
+  "classif.mlp",
+  predict_type = "prob",
+  optimizer = "adam",
+  epochs = best_params$epochs,
+  batch_size = best_params$batch_size,
+  neurons = best_params$neurons,
+  p = best_params$p,
+  n_layers = best_params$n_layers,
+  activation = best_params$activation
+)
+
+# Train final model
+final_learner$train(task_train)
+
+# Evaluate on test data
+pred <- final_learner$predict(task_test)
+
+pred$score(msr("classif.ce"))
+pred$score(msr("classif.sensitivity"))
+pred$score(msr("classif.specificity"))
+pred$score(msr("classif.auc"))
+lrn("classif.mlp")$param_set$levels$activation
 
 
 #### 3. Model performance
@@ -277,26 +359,70 @@ rr_xgb$aggregate(msr("classif.ce"))
 
 #We used classification error (Number of incorrect predictions / Total number of predictions). 
 
-#Logistic Regression
-#Classification error (CE) = 0.1363923
 
-#Baseline with no features
-#Classification error (CE) = 0.139881
 
-##Elastic net regularization 
-#Classification error (CE) = 0.1357222 
+#### 3. Model performance: Benchmark comparison via 5-fold CV
 
-##Full decision tree 
-#Classification error (CE) =  0.1558341
+future::plan("sequential")
 
-##Pruned decision tree (weakest-link pruning)
-#Classification error (CE) = 0.1346421
+task$positive = "1"
 
-##Decision tree (Random forest)
-#Classification error (CE) = 0.133763
 
-##Decision tree (XGboost)
-#Classification error (CE) = 0.1416391
+
+# Elastic net (tuned inside CV)
+
+elastic_net_at = auto_tuner(
+  learner = graph_learner_elastic_net_auto,
+  resampling = rsmp("cv", folds = 5),
+  measure = msr("classif.ce"),
+  tuner = tnr("random_search", batch_size = 20),
+  terminator = trm("evals", n_evals = 50)
+)
+
+elastic_net_at$id = "elastic_net"
+
+
+# Assign learner id
+graph_learner_lr$id = "logistic"
+baseline$id = "featureless"
+full_tree$id = "cart_large"
+pruned_tree$id = "cart_pruned"
+rf_model$id = "random_forest"
+xgb_model$id = "xgboost"
+
+
+# Benchmark
+set.seed(2026)
+
+benchmark_design = benchmark_grid(
+  tasks = list(task),
+  learners = list(
+    baseline,
+    graph_learner_lr,
+    elastic_net_at,
+    full_tree,
+    pruned_tree,
+    rf_model,
+    xgb_model
+  ),
+  resamplings = list(rsmp("cv", folds = 5))
+)
+
+res = benchmark(
+  benchmark_design,
+  store_models = TRUE
+)
+
+
+
+benchmark_results = res$aggregate(list(
+  msr("classif.ce"),
+  msr("classif.sensitivity"),
+  msr("classif.specificity"),
+  msr("classif.auc")
+))
+
+benchmark_results
 
 
 #### 4. Interpretability and feature importance
@@ -328,4 +454,4 @@ rr_xgb$aggregate(msr("classif.ce"))
 #Vizualisation for sensitive variables and non-sensitive for comparison
 
 #Sensitive variables can be identified by allready established correlations e.g. increased risk of diabetes with increasing BMI and also by modelling the data.
-#compare prediction of models without sensitive variables. We would expect less accuracy using the same models without the the sensitive variables.
+#compare prediction of models without sensitive variables. We would expect less accuracy using the same models without
