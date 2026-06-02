@@ -319,6 +319,7 @@ final_learner <- lrn("classif.mlp",
 final_learner$train(task_train)
 
 final_learner$predict(task_test)$score(msr("classif.ce"))
+final_learner$predict(task_test)$score(msr("classif.auc"))
 final_learner$predict(task_test)$score(msr("classif.sensitivity"))
 final_learner$predict(task_test)$score(msr("classif.specificity"))
 
@@ -417,3 +418,128 @@ cat(sprintf("Test precision: %.8f\n", precision_test))
 
 #Sensitive variables can be identified by allready established correlations e.g. increased risk of diabetes with increasing BMI and also by modelling the data.
 #compare prediction of models without sensitive variables. We would expect less accuracy using the same models without the the sensitive variables.
+protected_features <- c("AnyHealthcare", "Education", "Income", "NoDocbcCost")
+permitted_features <- setdiff(task_train$feature_names, protected_features)
+task_restricted <- task_train$clone()
+task_restricted$select(permitted_features)
+task_restricted$positive <- "1"
+
+lrn_logreg <- lrn("classif.log_reg", predict_type = "prob")
+
+lrn_glmnet <- lrn("classif.glmnet", predict_type = "prob")
+search_space_glmnet <- ps(
+  alpha = p_dbl(lower = 0, upper = 1),     # mixing between ridge (0) and lasso (1)
+  s = p_dbl(lower = 0.001, upper = 1, logscale = TRUE)   # lambda penalty
+)
+
+lrn_rpart <- lrn("classif.rpart", predict_type = "prob")
+search_space_rpart <- ps(cp = p_dbl(lower = 0.001, upper = 0.1, logscale = TRUE))
+
+lrn_xgboost <- lrn("classif.xgboost", predict_type = "prob")
+search_space_xgboost <- ps(
+  eta = p_dbl(lower = 0.01, upper = 0.3, logscale = TRUE),   # learning rate
+  max_depth = p_int(lower = 3, upper = 10),
+  subsample = p_dbl(lower = 0.5, upper = 1),
+  colsample_bytree = p_dbl(lower = 0.5, upper = 1),
+  nrounds = p_int(lower = 50, upper = 500, logscale = TRUE)
+)
+
+lrn_nnet <- lrn("classif.nnet", predict_type = "prob", trace = FALSE)
+search_space_nnet <- ps(
+  size = p_int(lower = 1, upper = 10),
+  decay = p_dbl(lower = 0.0001, upper = 0.1, logscale = TRUE)
+)
+
+resampling <- rsmp("cv", folds = 5)
+measure <- msr("classif.recall", id = "recall")
+tuner <- tnr("random_search", batch_size = 2)
+
+tune_learner <- function(learner, search_space, term_evals = 10) {
+  at <- auto_tuner(
+    tuner = tuner,
+    learner = learner,
+    resampling = resampling,
+    measure = measure,
+    search_space = search_space,
+    term_evals = term_evals
+  )
+  at$train(task_restricted)
+  return(at)
+}
+
+lrn_logreg$train(task_restricted)
+lrn_glmnet$train(task_restricted)
+lrn_rpart$train(task_restricted)
+lrn_xgboost$train(task_restricted)
+lrn_nnet$train(task_restricted)
+at_glmnet <- tune_learner(lrn_glmnet, search_space_glmnet, term_evals = 10)
+at_rpart <- tune_learner(lrn_rpart, search_space_rpart, term_evals = 10)
+at_xgboost <- tune_learner(lrn_xgboost, search_space_xgboost, term_evals = 10)
+at_nnet <- tune_learner(lrn_nnet, search_space_nnet, term_evals = 10)
+
+# test performance
+learners_list <- list(
+  lrn_logreg,
+  lrn_glmnet,
+  lrn_rpart,
+  lrn_xgboost,
+  lrn_nnet
+)
+
+task_test_restricted <- task_test$clone()
+task_test_restricted$select(permitted_features)
+
+design <- benchmark_grid(
+  tasks = task_test_restricted,
+  learners = learners_list,
+  resamplings = rsmp("cv", folds = 5)   # use CV on test set for robust comparison
+)
+bmr <- benchmark(design, store_models = FALSE)
+
+
+bmr_agg <- bmr$aggregate(msr("classif.recall", positive = "1"))
+bmr_agg[, .(learner_id, recall)] %>% arrange(-recall)
+
+
+# fairness
+ref_data <- task_train$data()[sample(task_train$nrow, 1000), ..protected_features]
+ref_dt <- as.data.table(ref_data)
+
+fair_rule_predict <- function(permitted_matrix, model = final_learner, ref_protected = ref_dt) {
+  n_ref <- nrow(ref_protected)
+  n_test <- nrow(permitted_matrix)
+  
+  preds_list <- vector("list", n_ref)
+  
+  for (i in 1:n_ref) {
+    test_rows <- data.frame(matrix(NA, nrow = n_test, ncol = length(permitted_features) + length(protected_features)))
+    colnames(test_rows) <- c(permitted_features, protected_features)
+    test_rows[, permitted_features] <- permitted_matrix
+    for (j in seq_along(protected_features)) {
+      test_rows[, protected_features[j]] <- ref_protected[[j]][i]
+    }
+    preds_list[[i]] <- final_learner$predict_newdata(newdata = test_rows, predict_type = "prob")$prob[, "1"]
+  }
+  
+  # Average over reference distribution
+  rowMeans(do.call(cbind, preds_list))
+}
+
+test_permitted <- task_test$data(cols = permitted_features)
+test_all <- task_test$data(cols = task_test$feature_names)
+
+pred_original <- final_learner$predict_newdata(test_all, predict_type = "prob")$prob[, "1"]
+pred_fair <- fair_rule_predict(as.data.frame(test_permitted))
+pred_restricted <- final_learner_restricted$predict_newdata(test_permitted, predict_type = "prob")$prob[, "1"]
+
+# Compute recall (using best threshold from original model for consistency)
+threshold <- 0.5  # if we have found a tuned threshold for all models, we use that instead
+
+recall_orig <- mean(pred_original[test_true == 1] >= threshold)
+recall_fair <- mean(pred_fair[test_true == 1] >= threshold)
+recall_restricted <- mean(pred_restricted[test_true == 1] >= threshold)
+
+cat("Test recall (sensitivity) for diabetes:\n")
+cat(sprintf("Original model:      %.3f\n", recall_orig))
+cat(sprintf("Fair rule:           %.3f\n", recall_fair))
+cat(sprintf("Restricted model:    %.3f\n", recall_restricted))
