@@ -15,8 +15,7 @@ library(iml)
 library(ggplot2)
 library(ranger)
 
-future::plan("multisession") 
-# future::plan("multicore")  # only works on Linux/macOS
+future::plan("multisession")
 
 #Import dataset
 diabetes <- read.csv("project/diabetes.csv")
