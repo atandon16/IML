@@ -423,6 +423,9 @@ permitted_features <- setdiff(task_train$feature_names, protected_features)
 task_restricted <- task_train$clone()
 task_restricted$select(permitted_features)
 task_restricted$positive <- "1"
+test_restricted <- task_test$clone()
+test_restricted$select(permitted_features)
+
 
 lrn_logreg <- lrn("classif.log_reg", predict_type = "prob")
 
@@ -451,7 +454,7 @@ search_space_nnet <- ps(
 )
 
 resampling <- rsmp("cv", folds = 5)
-measure <- msr("classif.recall", id = "recall")
+measure <- msr("classif.auc", id = "auc")
 tuner <- tnr("random_search", batch_size = 2)
 
 tune_learner <- function(learner, search_space, term_evals = 10) {
@@ -472,10 +475,10 @@ lrn_glmnet$train(task_restricted)
 lrn_rpart$train(task_restricted)
 lrn_xgboost$train(task_restricted)
 lrn_nnet$train(task_restricted)
-at_glmnet <- tune_learner(lrn_glmnet, search_space_glmnet, term_evals = 10)
-at_rpart <- tune_learner(lrn_rpart, search_space_rpart, term_evals = 10)
-at_xgboost <- tune_learner(lrn_xgboost, search_space_xgboost, term_evals = 10)
-at_nnet <- tune_learner(lrn_nnet, search_space_nnet, term_evals = 10)
+#at_glmnet <- tune_learner(lrn_glmnet, search_space_glmnet, term_evals = 10)
+#at_rpart <- tune_learner(lrn_rpart, search_space_rpart, term_evals = 10)
+#at_xgboost <- tune_learner(lrn_xgboost, search_space_xgboost, term_evals = 10)
+#at_nnet <- tune_learner(lrn_nnet, search_space_nnet, term_evals = 10)
 
 # test performance
 learners_list <- list(
@@ -486,22 +489,30 @@ learners_list <- list(
   lrn_nnet
 )
 
-task_test_restricted <- task_test$clone()
-task_test_restricted$select(permitted_features)
-
-design <- benchmark_grid(
-  tasks = task_test_restricted,
-  learners = learners_list,
-  resamplings = rsmp("cv", folds = 5)   # use CV on test set for robust comparison
+measures <- list(
+  acc = msr("classif.acc"),
+  recall = msr("classif.recall"),
+  spec = msr("classif.specificity"),
+  auc = msr("classif.auc")
 )
-bmr <- benchmark(design, store_models = FALSE)
+
+results <- rbindlist(lapply(learners_list, function(learner) {
+  # ensure predict_type for AUC/prob-based measures
+  pred <- learner$predict(test_restricted)
+  scores <- sapply(measures, function(m) pred$score(m))
+  data.table(
+    learner = learner$id,
+    class_error = 1 - scores["acc.classif.acc"],
+    sensitivity = scores["recall.classif.recall"],
+    specificity = scores["spec.classif.specificity"],
+    auc = scores["auc.classif.auc"]
+  )
+}))
+
+print(results)
 
 
-bmr_agg <- bmr$aggregate(msr("classif.recall", positive = "1"))
-bmr_agg[, .(learner_id, recall)] %>% arrange(-recall)
-
-
-# fairness
+# fairness - computed using nnet
 ref_data <- task_train$data()[sample(task_train$nrow, 1000), ..protected_features]
 ref_dt <- as.data.table(ref_data)
 
@@ -525,15 +536,14 @@ fair_rule_predict <- function(permitted_matrix, model = final_learner, ref_prote
   rowMeans(do.call(cbind, preds_list))
 }
 
-test_permitted <- task_test$data(cols = permitted_features)
 test_all <- task_test$data(cols = task_test$feature_names)
 
 pred_original <- final_learner$predict_newdata(test_all, predict_type = "prob")$prob[, "1"]
 pred_fair <- fair_rule_predict(as.data.frame(test_permitted))
-pred_restricted <- final_learner_restricted$predict_newdata(test_permitted, predict_type = "prob")$prob[, "1"]
+pred_restricted <- lrn_nnet$predict_newdata(test_permitted, predict_type = "prob")$prob[, "1"]
 
-# Compute recall (using best threshold from original model for consistency)
-threshold <- 0.5  # if we have found a tuned threshold for all models, we use that instead
+# Compute recall 
+threshold <- 0.22
 
 recall_orig <- mean(pred_original[test_true == 1] >= threshold)
 recall_fair <- mean(pred_fair[test_true == 1] >= threshold)
@@ -543,3 +553,6 @@ cat("Test recall (sensitivity) for diabetes:\n")
 cat(sprintf("Original model:      %.3f\n", recall_orig))
 cat(sprintf("Fair rule:           %.3f\n", recall_fair))
 cat(sprintf("Restricted model:    %.3f\n", recall_restricted))
+auc(test_true, pred_original, positive="1")
+auc(test_true, pred_fair, positive="1")
+auc(test_true, pred_restricted, positive="1")
