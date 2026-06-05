@@ -1,6 +1,6 @@
-#### Option 1: CDC Diabetes Health Indicators
-#For the CDC Diabetes Health Indicators dataset, you should build classification models predicting Diabetes_binary.
-
+# Examination - Diabetes.R
+# Authors: Therese Holmager, Arnav Tandon, Sebastian Winkelmann
+# CDC Diabetes Health Indicators
 
 library(mlr3)
 library(mlr3learners)
@@ -10,18 +10,24 @@ library(mlr3pipelines)
 library(paradox)
 library(future)
 library(tidyverse)
+library(data.table)
+library(iml)
+library(ggplot2)
+library(ranger)
 
-future::plan("multisession") 
-# future::plan("multicore")  # only works on Linux/macOS
+future::plan("multisession")
 
 #Import dataset
-diabetes <- read.csv("C:/Users/THOL0099/Desktop/Diabetes.csv")
+diabetes <- read.csv("project/diabetes.csv")
 #The dataset has 253680 observations and 22 variables
 
+task = as_task_classif(diabetes, target = "Diabetes_binary")
+set.seed(2026)
 
-#### Pre-processing. Do you need to perform any pre-processing?
+idx <- sample(nrow(diabetes), 5000)
+diabetes_small <- diabetes[idx, ]
 
-#I use table to check if all values match the variable description, e.g. binary variables being 0 or 1, and see if there is missing values.
+# Use table to check if all values match the variable description (e.g. binary variables being 0 or 1) and see if there are missing values.
 table(diabetes$Diabetes_binary, useNA = "ifany")
 prop.table(table(diabetes$Diabetes_binary, useNA = "ifany"))
 table(diabetes$HighBP, useNA = "ifany")
@@ -50,14 +56,13 @@ table(diabetes$Income, useNA = "ifany")
 #No missing values
 
 sum(duplicated(diabetes))
-24206/253680
-#24206 duplicated values (9.5% of all observations)
+#24206 duplicated values of 253680 (9.5% of all observations)
 #We chose not to delete duplicated rows, as we believe that more than one person with identical values for the 22 variables with few categories may be possible.
 
 
 #### Choice of models
 
-#We start by define task in the dataset and splitting it (80% training 20% test)
+# We start by defining task in the dataset and splitting it into 5 folds (80% training, 20% test)
 task = as_task_classif(diabetes, target = "Diabetes_binary")
 set.seed(2026)
 splits = partition(task, ratio = 0.8)
@@ -68,9 +73,7 @@ task_test = task$clone()$filter(splits$test)
 task_train$positive = "1"
 task_test$positive = "1"
 
-
-
-#Logistic Regression. Logistic regression 
+# Logistic Regression
 my_lr_learner = lrn("classif.log_reg",
                     predict_type = "prob")
 
@@ -86,13 +89,13 @@ graph_learner_lr$predict(task_test)$score(msr("classif.sensitivity"))
 graph_learner_lr$predict(task_test)$score(msr("classif.specificity"))
 graph_learner_lr$predict(task_test)$score(msr("classif.auc"))
 
-#Get coefficients
+# Get coefficients
 glm_model <- graph_learner_lr$model$classif.log_reg$model
 coef(glm_model)
 
 
 
-#Naive model / Baseline with no features
+# Naive model / Baseline with no features
 task_train$positive = "1"
 task_test$positive = "1"
 baseline <- lrn("classif.featureless",
@@ -104,17 +107,17 @@ baseline$predict(task_test)$score(msr("classif.auc"))
 
 
 
-#Elastic net. Elastic net combines Lasso (L1) and Ridde (L2) regularization in a model
+# Elastic net. Elastic net combines Lasso (L1) and Ridde (L2) regularization in a model
 
-#First we create a learner. 
+# First we create a learner. 
 my_elasticnet_learner = lrn( "classif.glmnet", predict_type = "prob", 
 standardize = FALSE, alpha = to_tune(0, 1), lambda = to_tune(p_dbl(log(1e-5), log(1e1), trafo = exp))) 
 # Alternatively lambda = to_tune(1e-5, 1e1, logscale=TRUE) ) 
 
-#We create a graph that converts factor variables into dummy variables, standardizes predictors, and afterwards applies elastic net
+# We create a graph that converts factor variables into dummy variables, standardizes predictors, and afterwards applies elastic net
 graph_learner_elastic_net = as_learner( po("encode", method = "treatment", id = "binary_enc") %>>% po("scale") %>>% my_elasticnet_learner )
 
-#5-fold cross-validation for elastic net model (train on 4 folds, validate on 1 fold, repeat 5 times). 
+# 5-fold cross-validation for elastic net model (train on 4 folds, validate on 1 fold, repeat 5 times). 
 set.seed(2026)
 instance = tune(
   tuner = tnr("random_search", batch_size=20), 
@@ -125,10 +128,10 @@ instance = tune(
   terminator = trm("evals", n_evals = 50) 
 )
 
-# keep an untuned copy of the same graph
+# Keep an untuned copy of the same graph
 graph_learner_elastic_net_auto = graph_learner_elastic_net$clone(deep = TRUE)
 
-# result on test set
+# Result on test set
 graph_learner_elastic_net$param_set$values = instance$result_learner_param_vals
 graph_learner_elastic_net$train(task_train)
 graph_learner_elastic_net$predict(task_test)$score(msr("classif.ce"))
@@ -136,29 +139,25 @@ graph_learner_elastic_net$predict(task_test)$score(msr("classif.sensitivity"))
 graph_learner_elastic_net$predict(task_test)$score(msr("classif.specificity"))
 graph_learner_elastic_net$predict(task_test)$score(msr("classif.auc"))
 
-#Get coefficients
+# Get coefficients
 glmnet_model <- graph_learner_elastic_net$model$classif.glmnet$model
 coef(glmnet_model)
 
 
 
-#Full CART decision tree
+# Full CART decision tree
 set.seed(123)
 
-# load data and define task
-task = as_task_classif(diabetes, target = "Diabetes_binary")
 
-# Diabetes = 1 is the outcome of interest.
-positive_class = "1"
-task$positive = positive_class
+task <- as_task_classif(diabetes_small, target = "Diabetes_binary")
+task$positive <- "1"
 
-#Create a graph that dummy-encodes categorical features and then applies learner
-categorical_selector = selector_type(c("factor", "ordered"))
+categorical_selector <- selector_type(c("factor", "ordered"))
 
-make_encoded_learner = function(learner) {
+make_encoded_learner <- function(learner) {
   as_learner(
     po("encode", method = "treatment",
-       affect_columns = categorical_selector, id = "binary_enc") %>>%
+       affect_columns = categorical_selector) %>>%
       learner
   )
 }
@@ -186,7 +185,7 @@ rr_full$aggregate(msr("classif.sensitivity"))
 rr_full$aggregate(msr("classif.specificity"))
 rr_full$aggregate(msr("classif.auc"))
 
-#Cross-validation path for pruning parameter (weakest-link pruning)
+# Cross-validation path for pruning parameter (weakest-link pruning)
 my_cart_learner_cv = lrn("classif.rpart",
                          cp = 0,
                          xval = 5,
@@ -202,7 +201,7 @@ rpart::printcp(cart_trained_cv)
 
 
 
-#Pruned CART decision tree
+# Pruned CART decision tree
 cp_table = cart_trained_cv$cptable
 min_row = which.min(cp_table[, "xerror"])
 one_se_threshold = cp_table[min_row, "xerror"] + cp_table[min_row, "xstd"]
@@ -236,19 +235,28 @@ rr_pruned$aggregate(msr("classif.sensitivity"))
 rr_pruned$aggregate(msr("classif.specificity"))
 rr_pruned$aggregate(msr("classif.auc"))
 
-
-
-#Random Forest
-rf_learner = lrn(
+# Random Forest
+rf_learner <- lrn(
   "classif.ranger",
-  predict_type = "prob"
+  predict_type = "prob",
+  num.trees = 200,
+  num.threads = 4
 )
 
-rf_model = make_encoded_learner(rf_learner)
-
+rf_model <- make_encoded_learner(rf_learner)
 rf_model$train(task)
 
-#5-fold cross-validation for random forest
+X <- diabetes_small[, colnames(diabetes_small) != "Diabetes_binary"]
+y <- diabetes_small$Diabetes_binary
+
+predictor_rf <- Predictor$new(
+  model = rf_model,
+  data = X,
+  y = y,
+  type = "prob"
+)
+
+# 5-fold cross-validation for random forest
 rr_rf = resample(
   task,
   rf_model,
@@ -260,22 +268,19 @@ rr_rf$aggregate(msr("classif.sensitivity"))
 rr_rf$aggregate(msr("classif.specificity"))
 rr_rf$aggregate(msr("classif.auc"))
 
-
-
-#XGboost
+# XGboost
 xgb_learner = lrn(
   "classif.xgboost",
   predict_type = "prob"
 )
 
 xgb_model = make_encoded_learner(xgb_learner)
-
 xgb_model$train(task)
 
-#5-fold cross-validation for XGboost
+# 5-fold cross-validation for XGboost
 rr_xgb = resample(
   task,
-  xgb_model,
+  rf_model,
   rsmp("cv", folds = 5)
 )
 
@@ -283,7 +288,6 @@ rr_xgb$aggregate(msr("classif.ce"))
 rr_xgb$aggregate(msr("classif.sensitivity"))
 rr_xgb$aggregate(msr("classif.specificity"))
 rr_xgb$aggregate(msr("classif.auc"))
-
 
 #### Model performance: Benchmark comparison via 5-fold CV
 
@@ -336,8 +340,6 @@ res = benchmark(
   store_models = TRUE
 )
 
-
-
 benchmark_results = res$aggregate(list(
   msr("classif.ce"),
   msr("classif.sensitivity"),
@@ -346,5 +348,48 @@ benchmark_results = res$aggregate(list(
 ))
 
 benchmark_results
+
+#### Post-hoc methods. We identify Random Forest as the best-performing model.
+
+# Individual conditional expectation
+ice <- FeatureEffect$new(
+  predictor_rf,
+  feature = "BMI",
+  method = "ice",
+  grid.size = 10
+)
+
+plot(ice)
+
+# Partial dependence plot
+pdp <- FeatureEffect$new(
+  predictor_rf,
+  feature = "BMI",
+  method = "pdp",
+  grid.size = 10
+)
+
+plot(pdp)
+
+# SHAP
+x_interest <- X[1, , drop = FALSE]
+
+shap <- Shapley$new(
+  predictor_rf,
+  x.interest = x_interest
+)
+
+plot(shap)
+shap$results
+
+# Permutation feature importance
+pfi <- FeatureImp$new(
+  predictor_rf,
+  loss = "ce",
+  compare = "difference"
+)
+
+plot(pfi)
+pfi$results
 
 
