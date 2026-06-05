@@ -23,7 +23,7 @@ library(ranger)
 future::plan("multisession")
 
 #Import dataset
-diabetes <- read.csv("project/diabetes.csv")
+diabetes <- read.csv("diabetes.csv") # Replace with local path
 #The dataset has 253680 observations and 22 variables
 
 task = as_task_classif(diabetes, target = "Diabetes_binary")
