@@ -4,6 +4,11 @@
 
 library(mlr3)
 library(mlr3learners)
+library(mlr3torch)
+library(mlr3viz)
+library(fastshap)
+library(iml)
+library(ggplot2)
 library(mlr3tuning)
 library(mlr3mbo)
 library(mlr3pipelines)
@@ -63,7 +68,7 @@ sum(duplicated(diabetes))
 #### Choice of models
 
 # We start by defining task in the dataset and splitting it into 5 folds (80% training, 20% test)
-task = as_task_classif(diabetes, target = "Diabetes_binary")
+task = as_task_classif(diabetes, target = "Diabetes_binary", positive = "1")
 set.seed(2026)
 splits = partition(task, ratio = 0.8)
 
@@ -293,11 +298,95 @@ rr_xgb$aggregate(msr("classif.auc"))
 
 future::plan("sequential")
 
-task$positive = "1"
+#Neural Network
+search_space <- ps(
+  neurons = p_int(lower = 16, upper = 128),
+  p = p_dbl(lower = 0.1, upper = 0.5),
+  batch_size = p_int(lower = 64, upper = 256),
+  epochs = p_int(lower = 20, upper = 50),
+  n_layers = p_int(lower = 1, upper = 20),
+  activation = p_fct(levels = c(nn_relu, nn_leaky_relu, nn_elu, nn_gelu, nn_tanh))
+)
 
+learner <- lrn("classif.mlp",
+               predict_type = "prob",
+               epochs = 30,
+               batch_size = 128,
+               neurons = 32,
+               p = 0.2,
+               optimizer = "adam",
+)
+
+resampling <- rsmp("cv", folds = 5)
+measure <- msr("classif.recall", id = "recall")
+tuner <- tnr("random_search")
+at <- auto_tuner(
+  tuner = tuner,
+  learner = learner_mlp,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  term_evals = 20 
+)
+
+at$train(task_train)
+at$tuning_result
+best_params <- at$tuning_result$learner_param_vals[[1]]
+
+final_learner <- lrn("classif.mlp",
+                     predict_type = "prob",
+                     epochs = best_params$epochs,
+                     batch_size = best_params$batch_size,
+                     neurons = best_params$neurons,
+                     p = best_params$p,
+                     optimizer = "adam",
+                     n_layers = best_params$n_layers
+)
+final_learner$train(task_train)
+
+final_learner$predict(task_test)$score(msr("classif.ce"))
+final_learner$predict(task_test)$score(msr("classif.auc"))
+final_learner$predict(task_test)$score(msr("classif.sensitivity"))
+final_learner$predict(task_test)$score(msr("classif.specificity"))
+
+
+# Find threshold that maximises accuracy and recall
+val_idx <- sample(task_train$nrow, size = floor(0.2 * task_train$nrow))
+val_task <- task_train$clone()$filter(val_idx)
+
+val_pred <- final_learner$predict(val_task)
+val_prob <- val_pred$prob[, "1"]
+val_true <- val_task$truth()
+
+thresholds <- seq(0.1, 0.9, by = 0.01)
+accuracy <- sapply(thresholds, function(th) {
+  pred_class <- ifelse(val_prob >= th, 1, 0)
+  tp <- sum(pred_class == 1 & val_true == 1)
+  fn <- sum(pred_class == 0 & val_true == 1)
+  fp <- sum(pred_class == 1 & val_true == 0)
+  acc <- tp / sqrt((tp + fn) * (tp + fp))
+  acc
+})
+
+best_threshold <- thresholds[which.max(accuracy)]
+
+
+test_task <- as_task_classif(task_test, target = "Diabetes_binary", positive = "1")
+test_pred <- final_learner$predict(test_task)
+test_prob <- test_pred$prob[, "1"]
+test_class <- ifelse(test_prob >= best_threshold, 1, 0)
+test_true <- test_task$truth()
+
+cm <- table(Predicted = test_class, Actual = test_true)
+recall_test <- cm[2,1] / sum(cm[,1])
+precision_test <- cm[2,1] / sum(cm[2,])
+ce_test <- (cm[1,1] + cm[2,2]) / sum(cm)
+
+cat(sprintf("Test CE-score: %.8f\n", ce_test))
+cat(sprintf("Test recall/sensitivity: %.8f\n", recall_test))
+cat(sprintf("Test precision: %.8f\n", precision_test))
 
 # Elastic net (tuned inside CV)
-
 elastic_net_at = auto_tuner(
   learner = graph_learner_elastic_net_auto,
   resampling = rsmp("cv", folds = 5),
@@ -305,8 +394,6 @@ elastic_net_at = auto_tuner(
   tuner = tnr("random_search", batch_size = 20),
   terminator = trm("evals", n_evals = 50)
 )
-
-
 
 # Assign learner id
 elastic_net_at$id = "elastic_net"
@@ -316,7 +403,6 @@ full_tree$id = "cart_large"
 pruned_tree$id = "cart_pruned"
 rf_model$id = "random_forest"
 xgb_model$id = "xgboost"
-
 
 # Benchmark
 set.seed(2026)
@@ -393,3 +479,144 @@ plot(pfi)
 pfi$results
 
 
+# Sensitive variables can be identified by already established correlations (e.g. increased risk of diabetes with increasing BMI) 
+# and also by modelling the data. Compare prediction of models without sensitive variables. We would expect less accuracy 
+# using the same models without the the sensitive variables.
+protected_features <- c("AnyHealthcare", "Education", "Income", "NoDocbcCost")
+permitted_features <- setdiff(task_train$feature_names, protected_features)
+task_restricted <- task_train$clone()
+task_restricted$select(permitted_features)
+task_restricted$positive <- "1"
+test_restricted <- task_test$clone()
+test_restricted$select(permitted_features)
+
+
+lrn_logreg <- lrn("classif.log_reg", predict_type = "prob")
+
+lrn_glmnet <- lrn("classif.glmnet", predict_type = "prob")
+search_space_glmnet <- ps(
+  alpha = p_dbl(lower = 0, upper = 1),     # mixing between ridge (0) and lasso (1)
+  s = p_dbl(lower = 0.001, upper = 1, logscale = TRUE)   # lambda penalty
+)
+
+lrn_rpart <- lrn("classif.rpart", predict_type = "prob")
+search_space_rpart <- ps(cp = p_dbl(lower = 0.001, upper = 0.1, logscale = TRUE))
+
+lrn_xgboost <- lrn("classif.xgboost", predict_type = "prob")
+search_space_xgboost <- ps(
+  eta = p_dbl(lower = 0.01, upper = 0.3, logscale = TRUE),   # learning rate
+  max_depth = p_int(lower = 3, upper = 10),
+  subsample = p_dbl(lower = 0.5, upper = 1),
+  colsample_bytree = p_dbl(lower = 0.5, upper = 1),
+  nrounds = p_int(lower = 50, upper = 500, logscale = TRUE)
+)
+
+lrn_nnet <- lrn("classif.nnet", predict_type = "prob", trace = FALSE)
+search_space_nnet <- ps(
+  size = p_int(lower = 1, upper = 10),
+  decay = p_dbl(lower = 0.0001, upper = 0.1, logscale = TRUE)
+)
+
+resampling <- rsmp("cv", folds = 5)
+measure <- msr("classif.auc", id = "auc")
+tuner <- tnr("random_search", batch_size = 2)
+
+tune_learner <- function(learner, search_space, term_evals = 10) {
+  at <- auto_tuner(
+    tuner = tuner,
+    learner = learner,
+    resampling = resampling,
+    measure = measure,
+    search_space = search_space,
+    term_evals = term_evals
+  )
+  at$train(task_restricted)
+  return(at)
+}
+
+lrn_logreg$train(task_restricted)
+lrn_glmnet$train(task_restricted)
+lrn_rpart$train(task_restricted)
+lrn_xgboost$train(task_restricted)
+lrn_nnet$train(task_restricted)
+#at_glmnet <- tune_learner(lrn_glmnet, search_space_glmnet, term_evals = 10)
+#at_rpart <- tune_learner(lrn_rpart, search_space_rpart, term_evals = 10)
+#at_xgboost <- tune_learner(lrn_xgboost, search_space_xgboost, term_evals = 10)
+#at_nnet <- tune_learner(lrn_nnet, search_space_nnet, term_evals = 10)
+
+# test performance
+learners_list <- list(
+  lrn_logreg,
+  lrn_glmnet,
+  lrn_rpart,
+  lrn_xgboost,
+  lrn_nnet
+)
+
+measures <- list(
+  acc = msr("classif.acc"),
+  recall = msr("classif.recall"),
+  spec = msr("classif.specificity"),
+  auc = msr("classif.auc")
+)
+
+results <- rbindlist(lapply(learners_list, function(learner) {
+  # ensure predict_type for AUC/prob-based measures
+  pred <- learner$predict(test_restricted)
+  scores <- sapply(measures, function(m) pred$score(m))
+  data.table(
+    learner = learner$id,
+    class_error = 1 - scores["acc.classif.acc"],
+    sensitivity = scores["recall.classif.recall"],
+    specificity = scores["spec.classif.specificity"],
+    auc = scores["auc.classif.auc"]
+  )
+}))
+
+print(results)
+
+
+# fairness - computed using nnet
+ref_data <- task_train$data()[sample(task_train$nrow, 1000), ..protected_features]
+ref_dt <- as.data.table(ref_data)
+
+fair_rule_predict <- function(permitted_matrix, model = final_learner, ref_protected = ref_dt) {
+  n_ref <- nrow(ref_protected)
+  n_test <- nrow(permitted_matrix)
+  
+  preds_list <- vector("list", n_ref)
+  
+  for (i in 1:n_ref) {
+    test_rows <- data.frame(matrix(NA, nrow = n_test, ncol = length(permitted_features) + length(protected_features)))
+    colnames(test_rows) <- c(permitted_features, protected_features)
+    test_rows[, permitted_features] <- permitted_matrix
+    for (j in seq_along(protected_features)) {
+      test_rows[, protected_features[j]] <- ref_protected[[j]][i]
+    }
+    preds_list[[i]] <- final_learner$predict_newdata(newdata = test_rows, predict_type = "prob")$prob[, "1"]
+  }
+  
+  # Average over reference distribution
+  rowMeans(do.call(cbind, preds_list))
+}
+
+test_all <- task_test$data(cols = task_test$feature_names)
+
+pred_original <- final_learner$predict_newdata(test_all, predict_type = "prob")$prob[, "1"]
+pred_fair <- fair_rule_predict(as.data.frame(test_permitted))
+pred_restricted <- lrn_nnet$predict_newdata(test_permitted, predict_type = "prob")$prob[, "1"]
+
+# Compute recall 
+threshold <- 0.22
+
+recall_orig <- mean(pred_original[test_true == 1] >= threshold)
+recall_fair <- mean(pred_fair[test_true == 1] >= threshold)
+recall_restricted <- mean(pred_restricted[test_true == 1] >= threshold)
+
+cat("Test recall (sensitivity) for diabetes:\n")
+cat(sprintf("Original model:      %.3f\n", recall_orig))
+cat(sprintf("Fair rule:           %.3f\n", recall_fair))
+cat(sprintf("Restricted model:    %.3f\n", recall_restricted))
+auc(test_true, pred_original, positive="1")
+auc(test_true, pred_fair, positive="1")
+auc(test_true, pred_restricted, positive="1")
